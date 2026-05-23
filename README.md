@@ -1,3 +1,5 @@
+REPO → https://github.com/Zeioth/open-webui-rag-router
+
 # Fast Simple Router for Open WebUI
 
 A lightweight, intelligent filter that routes user queries to the best expert model (each with its own RAG knowledge base), improving answer accuracy and reducing hallucinations.
