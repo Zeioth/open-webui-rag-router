@@ -99,7 +99,7 @@ The filter will now intercept every message, classify it, rewrite it, and guide 
 
 ## Performance notes
 
-- The small LLM (`llama3.2:3b`) runs on CPU and adds about 1–2 seconds per uncached query. With caches enabled, repeated queries are instant.
+- The small LLM (`llama3.2:3b`) runs on GPU and adds about 1–2 seconds per uncached query. With caches enabled, repeated queries are instant.
 - Embedding generation is not used by the filter (Open WebUI handles it internally), so no extra GPU/CPU load.
 - If VRAM is limited, the classifier model may swap — see Open WebUI's documentation on model keep‑alive.
 
