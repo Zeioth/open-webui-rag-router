@@ -9,8 +9,8 @@ A lightweight, intelligent filter that routes user queries to the best expert mo
 - Built‑in RAG guidance — inserts a system message that tells the model to use only the expert's dedicated knowledge collection.
 - Conversation continuity — a hybrid threshold prevents unnecessary expert switches during a chat.
 - Performance optimisations:
-  - String cache for expert classification.
-  - Rewrite cache to avoid repeated LLM calls.
+  - Async‑safe classification cache with configurable max size and TTL.
+  - Async‑safe rewrite cache with configurable max size and TTL.
   - Minimal tokens and temperature for fast generation.
 - Configurable via Open WebUI valves — no need to edit code to add, remove, or change experts.
 - Debug mode for detailed logging.
@@ -18,13 +18,13 @@ A lightweight, intelligent filter that routes user queries to the best expert mo
 ## How it works
 
 ### 1. Classification
-- First, checks an exact‑match cache of previous queries.
+- First, checks an async‑safe cache of previous queries (with TTL expiry).
 - If not cached, asks the small LLM ("router") to pick the best expert (or `generalista`).
 - Falls back to keyword matching if the LLM fails.
 
 ### 2. Query rewriting *(optional, enabled by default)*
 - If the expert has a `knowledge_base` description, the small LLM rewrites the query into a short, technical phrase that matches that knowledge base.
-- Results are cached by `(query, expert_id)`.
+- Results are cached by `(query, expert_id)`, with configurable max size and TTL.
 
 ### 3. Expert switch decision
 - A `change_threshold` checks shared words with the last user messages; if the topic seems stable, the current expert is kept.
@@ -54,7 +54,10 @@ All configuration is done through Open WebUI's valve interface.
 | `classifier_timeout` | `10` | Timeout (seconds) for classifier LLM calls. |
 | `enable_query_rewriting` | `true` | Rewrite the user query before RAG retrieval. |
 | `enable_rag_injection` | `true` | Insert a system message that forces the model to use only the expert's knowledge collection. |
-| `rewrite_cache_max_size` | `500` | Maximum number of cached rewritten queries. |
+| `string_cache_max_size` | `1000` | Maximum number of cached expert classification results. Set to `0` for unlimited. |
+| `string_cache_ttl` | `1800` | Time-to-live (seconds) for classification cache entries. Set to `0` for no expiry. |
+| `rewrite_cache_max_size` | `500` | Maximum number of cached rewritten queries (keyed by original query + expert). |
+| `rewrite_cache_ttl` | `3600` | Time-to-live (seconds) for rewritten query cache entries. Set to `0` for no expiry. |
 | `DEBUG` | `false` | Enable verbose logging to help troubleshooting. |
 
 ## Expert JSON format
@@ -99,14 +102,16 @@ The filter will now intercept every message, classify it, rewrite it, and guide 
 
 ## Performance notes
 
-- The small LLM (`llama3.2:3b`) runs on GPU and adds about 1–2 seconds per uncached query. With caches enabled, repeated queries are instant.
+- The small LLM (`llama3.2:3b`) runs on CPU and adds about 1–2 seconds per uncached query. With caches enabled, repeated queries are instant.
+- Both caches (classification and rewrite) are async‑safe and support independent TTL and max size configuration. Setting TTL to `0` disables expiry; setting max size to `0` allows unlimited entries.
+- Cache configuration is synchronised automatically at each request — no restart needed after changing valve values.
 - Embedding generation is not used by the filter (Open WebUI handles it internally), so no extra GPU/CPU load.
 - If VRAM is limited, the classifier model may swap — see Open WebUI's documentation on model keep‑alive.
 
 ## Debugging
 
-Set `DEBUG = true` to see detailed logs in the Open WebUI server console, including classifier decisions, rewrite results, and cache hits.
+Set `DEBUG = true` to see detailed logs in the Open WebUI server console, including classifier decisions, rewrite results, and cache hits/misses.
 
 ---
 
-*License: GPL3.*
+*License: MIT (feel free to adapt).*
