@@ -78,6 +78,19 @@ class Filter:
             default=10,
             description="Timeout (seconds) for classifier LLM calls.",
         )
+        # -- Default LLM parameters (used when not overridden by specific calls) --
+        default_llm_temperature: float = Field(
+            default=0.3,
+            description="Default temperature for LLM calls when no explicit value is given.",
+        )
+        default_llm_max_tokens: int = Field(
+            default=256,
+            description="Default max tokens for LLM responses. Increase for tasks requiring longer answers.",
+        )
+        default_llm_timeout: int = Field(
+            default=30,
+            description="Default timeout (seconds) for LLM API calls.",
+        )
         # -- Query rewriting for better RAG retrieval --
         enable_query_rewriting: bool = Field(
             default=True,
@@ -113,11 +126,12 @@ class Filter:
 
     # endregion
 
-    # region ── Cache helper class (thread‑safe with TTL) ─────────────────────
+    # region ── Cache helper class (thread‑safe with TTL, LRU via pop) ────────
     class _Cache:
         """Simple async‑safe cache with max size and TTL.
         - max_size = 0  -> unlimited size.
         - ttl = 0       -> no expiry.
+        Uses native dict + pop for LRU ordering.
         """
 
         def __init__(self, max_size: int = 1000, ttl: int = 1800):
@@ -136,8 +150,8 @@ class Filter:
                 if self.ttl > 0 and time.time() - timestamp > self.ttl:
                     del self._store[key]
                     return None
-                # Move to end to simulate LRU ordering (optional)
-                self._store.move_to_end(key)
+                # Move to end to simulate LRU ordering
+                self._store[key] = self._store.pop(key)
                 return value
 
         async def set(self, key: str, value: object):
@@ -151,8 +165,8 @@ class Filter:
                     oldest = next(iter(self._store))
                     del self._store[oldest]
                 self._store[key] = (value, time.time())
-                # Maintain insertion order for eviction policy
-                self._store.move_to_end(key)
+                # Move to end to maintain insertion / access order
+                self._store[key] = self._store.pop(key)
 
         async def clear(self):
             async with self._lock:
@@ -208,7 +222,6 @@ class Filter:
             logger.error(
                 f"[Router] Error parsing experts_json: {e}. Keeping previous expert list."
             )
-            # _experts remains unchanged (previous valid list, or empty if never loaded successfully)
 
     async def _sync_cache_config(self):
         """Ensure cache sizes/ttl match current valves (called in inlet)."""
@@ -239,11 +252,22 @@ class Filter:
         prompt: str,
         system: str = "",
         provider: str = "",
-        temperature: float = 0.3,
-        max_tokens: int = 700,
-        timeout: int = 120,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        timeout: Optional[int] = None,
     ) -> str:
-        """Send a prompt to the configured LLM provider (Ollama or OpenAI‑compatible)."""
+        """
+        Send a prompt to the configured LLM provider (Ollama or OpenAI‑compatible).
+        Uses valve defaults for temperature, max_tokens and timeout when not explicitly provided.
+        """
+        # Apply valve defaults if parameters are not specified
+        if temperature is None:
+            temperature = self.valves.default_llm_temperature
+        if max_tokens is None:
+            max_tokens = self.valves.default_llm_max_tokens
+        if timeout is None:
+            timeout = self.valves.default_llm_timeout
+
         base_url = self.valves.LLM_BASE_URL.rstrip("/")
         api_token = (
             self.valves.LLM_API_TOKEN.strip()
