@@ -2,8 +2,9 @@
 import json
 import logging
 import time
+import hashlib
+import asyncio
 from typing import Dict, List, Optional, Tuple
-
 import anyio
 import requests
 from pydantic import BaseModel, Field
@@ -39,72 +40,71 @@ class Filter:
 ]""",
             description="JSON with expert definitions. Each must have 'id', 'name', 'keywords' (list). Optional: 'description', 'examples', 'knowledge_base', 'collection_name'.",
         )
-
         default_model: str = Field(
             default="generalista",
             description="ID of the generalist model (used when no expert detected).",
         )
-
         change_threshold: int = Field(
             default=2,
             description="Minimum number of shared words with previous context to NOT switch experts.",
         )
-
         notify_change: bool = Field(
             default=True,
             description="Show notifications in the UI when the expert changes.",
         )
-
         notification_template: str = Field(
             default="🎯 Using expert: {expert}",
             description="Notification message template. Use {expert} for the expert name.",
         )
-
         # -- LLM call settings --
         LLM_BASE_URL: str = Field(
             default="http://host.docker.internal:11434/",
             description="Base URL for LLM API (Ollama or OpenAI compatible).",
         )
-
         LLM_API_TOKEN: str = Field(
             default="",
             description="API token (leave empty if not required).",
         )
-
         # -- Classifier LLM settings --
         classifier_model: str = Field(
             default="ollama/llama3.2:3b",
             description="Small model used for LLM-based classification and query rewriting.",
         )
-
         classifier_temperature: float = Field(
             default=0.0,
             description="Temperature for the classifier LLM.",
         )
-
         classifier_timeout: int = Field(
             default=10,
             description="Timeout (seconds) for classifier LLM calls.",
         )
-
         # -- Query rewriting for better RAG retrieval --
         enable_query_rewriting: bool = Field(
             default=True,
             description="Rewrite user query to a more precise technical phrase before retrieval.",
         )
-
         # -- Native RAG injection (via Open WebUI built-in pipeline) --
         enable_rag_injection: bool = Field(
             default=True,
             description="Guide the built-in RAG to use the expert's knowledge collection and focus the answer.",
         )
-
-        # -- Performance: rewrite cache size --
+        # -- Performance: cache sizes and TTLs --
         rewrite_cache_max_size: int = Field(
             default=500,
             description="Maximum number of cached rewritten queries (keyed by original + expert).",
         )
-
+        string_cache_max_size: int = Field(
+            default=1000,
+            description="Maximum number of cached expert classification results. Set to 0 for unlimited.",
+        )
+        string_cache_ttl: int = Field(
+            default=1800,  # 30 minutes
+            description="Time-to-live (seconds) for classification cache entries. Set to 0 for no expiry.",
+        )
+        rewrite_cache_ttl: int = Field(
+            default=3600,  # 1 hour
+            description="Time-to-live (seconds) for rewritten query cache entries. Set to 0 for no expiry.",
+        )
         # -- Debug mode --
         DEBUG: bool = Field(
             default=False,
@@ -113,31 +113,123 @@ class Filter:
 
     # endregion
 
+    # region ── Cache helper class (thread‑safe with TTL) ─────────────────────
+    class _Cache:
+        """Simple async‑safe cache with max size and TTL.
+        - max_size = 0  -> unlimited size.
+        - ttl = 0       -> no expiry.
+        """
+
+        def __init__(self, max_size: int = 1000, ttl: int = 1800):
+            self.max_size = max_size
+            self.ttl = ttl
+            self._store: Dict[str, Tuple[object, float]] = {}
+            self._lock = asyncio.Lock()
+
+        async def get(self, key: str) -> Optional[object]:
+            async with self._lock:
+                entry = self._store.get(key)
+                if entry is None:
+                    return None
+                value, timestamp = entry
+                # Expire only if ttl > 0
+                if self.ttl > 0 and time.time() - timestamp > self.ttl:
+                    del self._store[key]
+                    return None
+                # Move to end to simulate LRU ordering (optional)
+                self._store.move_to_end(key)
+                return value
+
+        async def set(self, key: str, value: object):
+            async with self._lock:
+                # Evict oldest if max_size > 0 and we are at capacity (key not already present)
+                if (
+                    self.max_size > 0
+                    and len(self._store) >= self.max_size
+                    and key not in self._store
+                ):
+                    oldest = next(iter(self._store))
+                    del self._store[oldest]
+                self._store[key] = (value, time.time())
+                # Maintain insertion order for eviction policy
+                self._store.move_to_end(key)
+
+        async def clear(self):
+            async with self._lock:
+                self._store.clear()
+
+    # endregion
+
     # region ── Initialization ─────────────────────────────────────────────────
     def __init__(self):
         self.valves = self.Valves()
         self._experts: List[dict] = []
-        self._load_experts()
+        self._experts_json_hash: Optional[str] = (
+            None  # hash of the JSON that produced _experts
+        )
+        self._load_experts()  # initial load
 
-        # Simple string cache for expert detection (original query -> expert_id)
-        self._string_cache: Dict[str, Tuple[str, float]] = {}
-
-        # Rewrite cache: (original_query, expert_id) -> rewritten_phrase
-        self._rewrite_cache: Dict[Tuple[str, str], str] = {}
+        # Initialize caches (they will be synced in inlet if valves change)
+        self._string_cache = self._Cache(
+            max_size=self.valves.string_cache_max_size, ttl=self.valves.string_cache_ttl
+        )
+        self._rewrite_cache = self._Cache(
+            max_size=self.valves.rewrite_cache_max_size,
+            ttl=self.valves.rewrite_cache_ttl,
+        )
 
     def _load_experts(self):
-        """Parse and validate expert JSON configuration."""
+        """Parse and validate expert JSON configuration. Only reload if JSON changed."""
         try:
-            self._experts = json.loads(self.valves.experts_json)
-            for exp in self._experts:
+            new_json = self.valves.experts_json
+            new_hash = hashlib.md5(new_json.encode()).hexdigest()
+            if self._experts_json_hash == new_hash:
+                # No change, keep existing experts
+                if self.valves.DEBUG:
+                    logger.info(
+                        "[Router] Expert configuration unchanged, keeping previous."
+                    )
+                return
+
+            # Attempt to parse new JSON
+            parsed = json.loads(new_json)
+            for exp in parsed:
                 required = {"id", "name", "keywords"}
                 if not required.issubset(exp.keys()):
                     raise ValueError(f"Expert missing required fields: {exp}")
+            # Valid: update
+            self._experts = parsed
+            self._experts_json_hash = new_hash
             if self.valves.DEBUG:
-                logger.info(f"[Router] Loaded {len(self._experts)} experts.")
+                logger.info(
+                    f"[Router] Loaded {len(self._experts)} experts. JSON hash updated."
+                )
         except Exception as e:
-            logger.error(f"[Router] Error parsing experts_json: {e}")
-            self._experts = []
+            logger.error(
+                f"[Router] Error parsing experts_json: {e}. Keeping previous expert list."
+            )
+            # _experts remains unchanged (previous valid list, or empty if never loaded successfully)
+
+    async def _sync_cache_config(self):
+        """Ensure cache sizes/ttl match current valves (called in inlet)."""
+        # String cache
+        if (
+            self._string_cache.max_size != self.valves.string_cache_max_size
+            or self._string_cache.ttl != self.valves.string_cache_ttl
+        ):
+            self._string_cache = self._Cache(
+                max_size=self.valves.string_cache_max_size,
+                ttl=self.valves.string_cache_ttl,
+            )
+        # Rewrite cache
+        if (
+            self._rewrite_cache.max_size != self.valves.rewrite_cache_max_size
+            or self._rewrite_cache.ttl != self.valves.rewrite_cache_ttl
+        ):
+            self._rewrite_cache = self._Cache(
+                max_size=self.valves.rewrite_cache_max_size,
+                ttl=self.valves.rewrite_cache_ttl,
+            )
 
     # endregion
 
@@ -158,11 +250,9 @@ class Filter:
             if self.valves.LLM_API_TOKEN and self.valves.LLM_API_TOKEN.strip()
             else None
         )
-
         model_str = provider or self.valves.classifier_model
         if "/" in model_str:
             model_str = model_str.split("/", 1)[1]
-
         is_ollama = "ollama" in base_url.lower() or ":11434" in base_url
 
         def _blocking():
@@ -284,44 +374,37 @@ class Filter:
 
     async def _classify_query(self, user_query: str) -> str:
         """Classify the query using string cache -> LLM -> keyword fallback."""
-        # 1. Exact string cache
-        exact = self._string_cache.get(user_query.lower())
-        if exact:
+        # 1. Check cache (with TTL)
+        cache_key = user_query.lower()
+        cached = await self._string_cache.get(cache_key)
+        if cached is not None:
             if self.valves.DEBUG:
-                logger.info(f"[Router] String cache hit: {exact}")
-            return exact
+                logger.info(f"[Router] String cache hit: {cached}")
+            return cached
 
         # 2. LLM classification
         expert_id = await self._classify_with_llm(user_query)
         if expert_id:
-            self._string_cache_set(user_query, expert_id)
+            await self._string_cache.set(cache_key, expert_id)
             return expert_id
 
         # 3. Keyword fallback
         expert_id = self._keyword_fallback(user_query)
         if expert_id:
-            self._string_cache_set(user_query, expert_id)
+            await self._string_cache.set(cache_key, expert_id)
             return expert_id
 
         # 4. Default
         return self.valves.default_model
-
-    def _string_cache_set(self, query: str, expert_id: str):
-        """Store in cache (simple FIFO eviction)."""
-        if len(self._string_cache) >= 1000:
-            oldest = next(iter(self._string_cache))
-            del self._string_cache[oldest]
-        self._string_cache[query.lower()] = expert_id
 
     # endregion
 
     # region ── Query rewriting (domain‑aware + rewrite cache) ───────────────
     async def _rewrite_query(self, original: str, expert_id: str) -> str:
         """Rewrite the user query into a precise search phrase, using cache if available."""
-        # Check rewrite cache
-        cache_key = (original.lower(), expert_id)
-        if cache_key in self._rewrite_cache:
-            cached = self._rewrite_cache[cache_key]
+        cache_key = f"{original.lower()}|{expert_id}"
+        cached = await self._rewrite_cache.get(cache_key)
+        if cached is not None:
             if self.valves.DEBUG:
                 logger.info(f"[Router] Rewrite cache hit: '{cached}'")
             return cached
@@ -348,7 +431,6 @@ class Filter:
                 f"Original question: {original}\n"
                 "Rewritten phrase:"
             )
-
         try:
             rewritten = await self._call_llm(
                 prompt=prompt,
@@ -365,11 +447,7 @@ class Filter:
             rewritten = original
 
         # Store in cache
-        if len(self._rewrite_cache) >= self.valves.rewrite_cache_max_size:
-            oldest = next(iter(self._rewrite_cache))
-            del self._rewrite_cache[oldest]
-        self._rewrite_cache[cache_key] = rewritten
-
+        await self._rewrite_cache.set(cache_key, rewritten)
         if self.valves.DEBUG:
             logger.info(
                 f"[Router] Rewritten query: '{original[:60]}...' -> '{rewritten}'"
@@ -426,7 +504,16 @@ class Filter:
                 return expert_id, exp["name"]
         return self.valves.default_model, "General"
 
-    async def inlet(self, body: dict, __user__: dict, __event_emitter__=None) -> dict:
+    async def inlet(self, body: dict, **kwargs) -> dict:
+        """
+        Open WebUI filter inlet. Extracts user and __event_emitter__ from kwargs.
+        """
+        user = kwargs.get("user", {})
+        __event_emitter__ = kwargs.get("__event_emitter__")
+
+        # Sync cache configuration with current valves
+        await self._sync_cache_config()
+        # Reload experts only if JSON changed (idempotent)
         self._load_experts()
 
         messages = body.get("messages", [])
@@ -435,8 +522,8 @@ class Filter:
 
         metadata = body.get("metadata", {})
         current_expert = metadata.get("router_expert")
-
         current_query = messages[-1].get("content", "")
+
         new_expert, new_name = await self._detect_expert(current_query)
 
         # Decide whether to switch (with context threshold)
@@ -496,7 +583,6 @@ class Filter:
                     "data": {"type": "info", "content": notif},
                 }
             )
-
         return body
 
     def _get_expert_name(self, expert_id: str) -> str:
