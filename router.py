@@ -120,8 +120,8 @@ class Filter:
         )
         # -- Debug mode --
         DEBUG: bool = Field(
-            default=False,
-            description="Enable detailed logging of routing decisions.",
+            default=True,
+            description="Enable detailed logging.",
         )
 
     # endregion
