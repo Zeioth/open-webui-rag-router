@@ -114,4 +114,4 @@ Set `DEBUG = true` to see detailed logs in the Open WebUI server console, includ
 
 ---
 
-*License: MIT (feel free to adapt).*
+*License: GPL3 (feel free to adapt).*
