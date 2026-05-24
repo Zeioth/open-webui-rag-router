@@ -474,8 +474,8 @@ class Filter:
     # region ── Native RAG injection ──────────────────────────────────────────
     def _inject_rag_guidance(self, expert_id: str, messages: list) -> bool:
         """
-        Insert a system message that guides the built-in RAG to use the
-        expert's knowledge collection and focus the answer.
+        Insert RAG guidance by appending it to the first system message,
+        preserving the original system prompt (which includes tool definitions).
         """
         collection = None
         kb_desc = None
@@ -494,12 +494,17 @@ class Filter:
 
         guidance = (
             f"You have access to the knowledge base '{collection}' ({kb_desc or 'specialized documents'}). "
-            "Use ONLY this knowledge base to answer the user's question. "
-            "If the answer is not found there, say so clearly. "
+            "Use this knowledge base when relevant, but you may also use other available tools. "
             "Answer in the same language as the user."
         )
-        # Insert as the first system message, keeping other system messages if any
-        messages.insert(0, {"role": "system", "content": guidance})
+        # Buscar el primer mensaje de sistema existente (que contiene la definición de herramientas)
+        sys_msg = next((m for m in messages if m.get("role") == "system"), None)
+        if sys_msg:
+            # Añadir la guía al final, sin borrar nada
+            sys_msg["content"] = sys_msg["content"] + "\n\n" + guidance
+        else:
+            messages.insert(0, {"role": "system", "content": guidance})
+
         if self.valves.DEBUG:
             logger.info(
                 f"[Router] Injected RAG guidance for collection '{collection}'."
