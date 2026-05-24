@@ -442,19 +442,10 @@ class Filter:
         rewritten = original
         if kb_desc:
             prompt = (
-                f"The knowledge base is: {kb_desc}.\n"
-                f"Rewrite the user question into a SHORT, TECHNICAL, PAGE-TITLE-LIKE phrase (max 5 words).\n"
-                f"Use the SAME language as the question. Answer ONLY the phrase, nothing else.\n\n"
-                f"Question: {original}\n"
-                f"Phrase:"
+                f"KB:{kb_desc}\nQ:{original}\nShort technical phrase (same language):"
             )
         else:
-            prompt = (
-                "Rewrite the following user question into a concise, technical search phrase in the SAME language.\n"
-                "Remove filler words, be specific, and use exact technical terms.\n"
-                f"Original question: {original}\n"
-                "Rewritten phrase:"
-            )
+            prompt = f"Q:{original}\nShort technical phrase (same language):"
         try:
             rewritten = await self._call_llm(
                 prompt=prompt,
