@@ -1,4 +1,14 @@
-# region ── Imports ────────────────────────────────────────────────────────────
+"""
+title: Router
+description: Smart router that selects the best expert model for each query based on keywords, LLM classification, and semantic similarity. Rewrites queries for better RAG retrieval and injects RAG guidance.
+author: zeioth
+author_url: https://github.com/zeioth
+funding_url: https://github.com/open-webui
+version: 1.0.0
+license: MIT
+requirements: aiohttp, loguru, orjson, tiktoken, sentence-transformers, chromadb
+"""
+
 import json
 import logging
 import time
@@ -10,13 +20,70 @@ import requests
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
-# endregion
+
+# Path to shared library
+import sys
+if "/app/backend/data/custom_lib" not in sys.path:
+    sys.path.append("/app/backend/data/custom_lib")
+
+# Shared resources (persistent cache & shared LLM caller)
+try:
+    from shared_resources import SQLiteCache, AsyncLRUCache  # type: ignore
+    _SHARED_RESOURCES_AVAILABLE = True
+except ImportError:
+    _SHARED_RESOURCES_AVAILABLE = False
+
+
+def _build_cache(table: str, max_size: int, ttl: int, db_path: str):
+    """
+    Build cache: L1 RAM (LRU) + L2 SQLite (persistent) when shared_resources is available.
+    Falls back to L1-only cache otherwise.
+    """
+    if _SHARED_RESOURCES_AVAILABLE:
+        return SQLiteCache(db_path=db_path, table=table, max_size=max_size, ttl=ttl)
+
+    # Minimal fallback with same async interface
+    import asyncio as _asyncio, time as _time
+
+    class _FallbackCache:
+        def __init__(self, max_size, ttl):
+            self._store = {}
+            self.max_size = max_size
+            self.ttl = ttl
+            self._lock = _asyncio.Lock()
+
+        async def get(self, key):
+            async with self._lock:
+                e = self._store.get(key)
+                if not e:
+                    return None
+                val, ts = e
+                if self.ttl > 0 and _time.time() - ts > self.ttl:
+                    del self._store[key]
+                    return None
+                self._store[key] = self._store.pop(key)
+                return val
+
+        async def set(self, key, val):
+            async with self._lock:
+                if (
+                    self.max_size > 0
+                    and len(self._store) >= self.max_size
+                    and key not in self._store
+                ):
+                    del self._store[next(iter(self._store))]
+                self._store[key] = (val, _time.time())
+                self._store[key] = self._store.pop(key)
+
+        async def clear(self):
+            async with self._lock:
+                self._store.clear()
+
+    return _FallbackCache(max_size, ttl)
 
 
 class Filter:
-    # region ── Configuration (Valves) ────────────────────────────────────────
     class Valves(BaseModel):
-        # -- Expert definitions --
         experts_json: str = Field(
             default="""[
     {
@@ -40,178 +107,73 @@ class Filter:
 ]""",
             description="JSON with expert definitions. Each must have 'id', 'name', 'keywords' (list). Optional: 'description', 'examples', 'knowledge_base', 'collection_name'.",
         )
-        default_model: str = Field(
-            default="generalista",
-            description="ID of the generalist model (used when no expert detected).",
-        )
-        change_threshold: int = Field(
-            default=2,
-            description="Minimum number of shared words with previous context to NOT switch experts.",
-        )
-        notify_change: bool = Field(
+        default_model: str = Field(default="generalista")
+        change_threshold: int = Field(default=2)
+        notify_change: bool = Field(default=True)
+        notification_template: str = Field(default="🎯 Using expert: {expert}")
+        LLM_BASE_URL: str = Field(default="http://host.docker.internal:11434/")
+        LLM_API_TOKEN: str = Field(default="")
+        classifier_model: str = Field(default="ollama/llama3.2:3b")
+        classifier_temperature: float = Field(default=0.0)
+        classifier_timeout: int = Field(default=10)
+        default_llm_temperature: float = Field(default=0.3)
+        default_llm_max_tokens: int = Field(default=256)
+        default_llm_timeout: int = Field(default=30)
+        enable_query_rewriting: bool = Field(default=True)
+        enable_rag_injection: bool = Field(default=True)
+        rewrite_cache_max_size: int = Field(default=500)
+        string_cache_max_size: int = Field(default=1000)
+        string_cache_ttl: int = Field(default=1800)
+        rewrite_cache_ttl: int = Field(default=3600)
+        USE_SEMANTIC_CLASSIFY: bool = Field(
             default=True,
-            description="Show notifications in the UI when the expert changes.",
+            description="Use embedding similarity before LLM for classification (faster)",
         )
-        notification_template: str = Field(
-            default="🎯 Using expert: {expert}",
-            description="Notification message template. Use {expert} for the expert name.",
+        SEMANTIC_THRESHOLD: float = Field(
+            default=0.55,
+            description="Minimum cosine similarity to classify without LLM (0–1)",
         )
-        # -- LLM call settings --
-        LLM_BASE_URL: str = Field(
-            default="http://host.docker.internal:11434/",
-            description="Base URL for LLM API (Ollama or OpenAI compatible).",
+        CACHE_DB_PATH: str = Field(
+            default="/app/backend/data/router_cache.db",
+            description="SQLite path for persistent classification and rewrite cache",
         )
-        LLM_API_TOKEN: str = Field(
-            default="",
-            description="API token (leave empty if not required).",
-        )
-        # -- Classifier LLM settings --
-        classifier_model: str = Field(
-            default="ollama/llama3.2:3b",
-            description="Small model used for LLM-based classification and query rewriting.",
-        )
-        classifier_temperature: float = Field(
-            default=0.0,
-            description="Temperature for the classifier LLM.",
-        )
-        classifier_timeout: int = Field(
-            default=10,
-            description="Timeout (seconds) for classifier LLM calls.",
-        )
-        # -- Default LLM parameters (used when not overridden by specific calls) --
-        default_llm_temperature: float = Field(
-            default=0.3,
-            description="Default temperature for LLM calls when no explicit value is given.",
-        )
-        default_llm_max_tokens: int = Field(
-            default=256,
-            description="Default max tokens for LLM responses. Increase for tasks requiring longer answers.",
-        )
-        default_llm_timeout: int = Field(
-            default=30,
-            description="Default timeout (seconds) for LLM API calls.",
-        )
-        # -- Query rewriting for better RAG retrieval --
-        enable_query_rewriting: bool = Field(
-            default=True,
-            description="Rewrite user query to a more precise technical phrase before retrieval.",
-        )
-        # -- Native RAG injection (via Open WebUI built-in pipeline) --
-        enable_rag_injection: bool = Field(
-            default=True,
-            description="Guide the built-in RAG to use the expert's knowledge collection and focus the answer.",
-        )
-        # -- Performance: cache sizes and TTLs --
-        rewrite_cache_max_size: int = Field(
-            default=500,
-            description="Maximum number of cached rewritten queries (keyed by original + expert).",
-        )
-        string_cache_max_size: int = Field(
-            default=1000,
-            description="Maximum number of cached expert classification results. Set to 0 for unlimited.",
-        )
-        string_cache_ttl: int = Field(
-            default=1800,  # 30 minutes
-            description="Time-to-live (seconds) for classification cache entries. Set to 0 for no expiry.",
-        )
-        rewrite_cache_ttl: int = Field(
-            default=3600,  # 1 hour
-            description="Time-to-live (seconds) for rewritten query cache entries. Set to 0 for no expiry.",
-        )
-        # -- Debug mode --
-        DEBUG: bool = Field(
-            default=True,
-            description="Enable detailed logging.",
-        )
+        DEBUG: bool = Field(default=True)
 
-    # endregion
-
-    # region ── Cache helper class (thread‑safe with TTL, LRU via pop) ────────
-    class _Cache:
-        """Simple async‑safe cache with max size and TTL.
-        - max_size = 0  -> unlimited size.
-        - ttl = 0       -> no expiry.
-        Uses native dict + pop for LRU ordering.
-        """
-
-        def __init__(self, max_size: int = 1000, ttl: int = 1800):
-            self.max_size = max_size
-            self.ttl = ttl
-            self._store: Dict[str, Tuple[object, float]] = {}
-            self._lock = asyncio.Lock()
-
-        async def get(self, key: str) -> Optional[object]:
-            async with self._lock:
-                entry = self._store.get(key)
-                if entry is None:
-                    return None
-                value, timestamp = entry
-                # Expire only if ttl > 0
-                if self.ttl > 0 and time.time() - timestamp > self.ttl:
-                    del self._store[key]
-                    return None
-                # Move to end to simulate LRU ordering
-                self._store[key] = self._store.pop(key)
-                return value
-
-        async def set(self, key: str, value: object):
-            async with self._lock:
-                # Evict oldest if max_size > 0 and we are at capacity (key not already present)
-                if (
-                    self.max_size > 0
-                    and len(self._store) >= self.max_size
-                    and key not in self._store
-                ):
-                    oldest = next(iter(self._store))
-                    del self._store[oldest]
-                self._store[key] = (value, time.time())
-                # Move to end to maintain insertion / access order
-                self._store[key] = self._store.pop(key)
-
-        async def clear(self):
-            async with self._lock:
-                self._store.clear()
-
-    # endregion
-
-    # region ── Initialization ─────────────────────────────────────────────────
     def __init__(self):
         self.valves = self.Valves()
         self._experts: List[dict] = []
-        self._experts_json_hash: Optional[str] = (
-            None  # hash of the JSON that produced _experts
-        )
-        self._load_experts()  # initial load
+        self._experts_json_hash: Optional[str] = None
+        self._load_experts()
 
-        # Initialize caches (they will be synced in inlet if valves change)
-        self._string_cache = self._Cache(
-            max_size=self.valves.string_cache_max_size, ttl=self.valves.string_cache_ttl
+        db_path = self.valves.CACHE_DB_PATH
+        self._string_cache = _build_cache(
+            "classifications",
+            self.valves.string_cache_max_size,
+            self.valves.string_cache_ttl,
+            db_path,
         )
-        self._rewrite_cache = self._Cache(
-            max_size=self.valves.rewrite_cache_max_size,
-            ttl=self.valves.rewrite_cache_ttl,
+        self._rewrite_cache = _build_cache(
+            "rewrites",
+            self.valves.rewrite_cache_max_size,
+            self.valves.rewrite_cache_ttl,
+            db_path,
         )
 
     def _load_experts(self):
-        """Parse and validate expert JSON configuration. Only reload if JSON changed."""
         try:
             new_json = self.valves.experts_json
             new_hash = hashlib.md5(new_json.encode()).hexdigest()
             if self._experts_json_hash == new_hash:
-                # No change, keep existing experts
                 if self.valves.DEBUG:
                     logger.info(
                         "[Router] Expert configuration unchanged, keeping previous."
                     )
                 return
-
-            # Attempt to parse new JSON
             parsed = json.loads(new_json)
             for exp in parsed:
                 required = {"id", "name", "keywords"}
                 if not required.issubset(exp.keys()):
                     raise ValueError(f"Expert missing required fields: {exp}")
-            # Valid: update
             self._experts = parsed
             self._experts_json_hash = new_hash
             if self.valves.DEBUG:
@@ -224,43 +186,38 @@ class Filter:
             )
 
     async def _sync_cache_config(self):
-        """Ensure cache sizes/ttl match current valves (called in inlet)."""
-        # String cache
+        db_path = self.valves.CACHE_DB_PATH
         if (
             self._string_cache.max_size != self.valves.string_cache_max_size
             or self._string_cache.ttl != self.valves.string_cache_ttl
         ):
-            self._string_cache = self._Cache(
-                max_size=self.valves.string_cache_max_size,
-                ttl=self.valves.string_cache_ttl,
+            self._string_cache = _build_cache(
+                "classifications",
+                self.valves.string_cache_max_size,
+                self.valves.string_cache_ttl,
+                db_path,
             )
-        # Rewrite cache
         if (
             self._rewrite_cache.max_size != self.valves.rewrite_cache_max_size
             or self._rewrite_cache.ttl != self.valves.rewrite_cache_ttl
         ):
-            self._rewrite_cache = self._Cache(
-                max_size=self.valves.rewrite_cache_max_size,
-                ttl=self.valves.rewrite_cache_ttl,
+            self._rewrite_cache = _build_cache(
+                "rewrites",
+                self.valves.rewrite_cache_max_size,
+                self.valves.rewrite_cache_ttl,
+                db_path,
             )
 
-    # endregion
-
-    # region ── LLM call (reused from shared code) ────────────────────────────
+    # --- LLM call using shared caller or aiohttp fallback ---
     async def _call_llm(
         self,
         prompt: str,
         system: str = "",
         provider: str = "",
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
-        timeout: Optional[int] = None,
+        temperature: float = None,
+        max_tokens: int = None,
+        timeout: int = None,
     ) -> str:
-        """
-        Send a prompt to the configured LLM provider (Ollama or OpenAI‑compatible).
-        Uses valve defaults for temperature, max_tokens and timeout when not explicitly provided.
-        """
-        # Apply valve defaults if parameters are not specified
         if temperature is None:
             temperature = self.valves.default_llm_temperature
         if max_tokens is None:
@@ -268,78 +225,89 @@ class Filter:
         if timeout is None:
             timeout = self.valves.default_llm_timeout
 
-        base_url = self.valves.LLM_BASE_URL.rstrip("/")
-        api_token = (
-            self.valves.LLM_API_TOKEN.strip()
-            if self.valves.LLM_API_TOKEN and self.valves.LLM_API_TOKEN.strip()
-            else None
-        )
         model_str = provider or self.valves.classifier_model
-        if "/" in model_str:
-            model_str = model_str.split("/", 1)[1]
-        is_ollama = "ollama" in base_url.lower() or ":11434" in base_url
 
-        def _blocking():
-            if is_ollama:
-                url = f"{base_url}/api/generate"
-                payload = {
-                    "model": model_str,
-                    "prompt": prompt,
-                    "system": system,
-                    "stream": False,
-                    "options": {
-                        "temperature": temperature,
-                        "num_predict": max_tokens,
-                    },
-                }
-                resp = requests.post(url, json=payload, timeout=timeout)
-                if resp.status_code != 200:
-                    raise RuntimeError(
-                        f"Ollama error {resp.status_code}: {resp.text[:200]}"
-                    )
-                data = resp.json()
-                if "error" in data:
-                    logger.error(f"Ollama model error: {data['error']}")
-                    return ""
-                return data.get("response", "")
-            else:
-                headers = {"Content-Type": "application/json"}
-                if api_token:
-                    headers["Authorization"] = f"Bearer {api_token}"
-                payload = {
-                    "model": model_str,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": prompt},
-                    ],
-                    "temperature": temperature,
-                    "max_tokens": max_tokens,
-                }
-                resp = requests.post(
-                    f"{base_url}/chat/completions",
-                    json=payload,
-                    headers=headers,
+        if _SHARED_RESOURCES_AVAILABLE:
+            from shared_resources import call_llm
+
+            try:
+                return await call_llm(
+                    prompt=prompt,
+                    system=system,
+                    base_url=self.valves.LLM_BASE_URL,
+                    model=model_str,
+                    api_token=self.valves.LLM_API_TOKEN,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
                     timeout=timeout,
                 )
-                if resp.status_code != 200:
-                    raise RuntimeError(
-                        f"OpenAI error {resp.status_code}: {resp.text[:200]}"
-                    )
-                return resp.json()["choices"][0]["message"]["content"]
+            except Exception as e:
+                logger.warning(f"[Router] shared call_llm failed: {e}, using fallback")
 
-        content = await anyio.to_thread.run_sync(_blocking)
-        if not content or not content.strip():
-            logger.warning(f"[Router] LLM returned empty content for '{model_str}'.")
-            return ""
+        # Fallback: aiohttp without shared pool
+        import aiohttp
+
+        base_url = self.valves.LLM_BASE_URL.rstrip("/")
+        api_token = (
+            self.valves.LLM_API_TOKEN.strip() if self.valves.LLM_API_TOKEN else None
+        )
+        model_name = model_str.split("/", 1)[1] if "/" in model_str else model_str
+        is_ollama = "ollama" in base_url.lower() or ":11434" in base_url
+
+        headers = {"Content-Type": "application/json"}
+        if api_token:
+            headers["Authorization"] = f"Bearer {api_token}"
+
+        if is_ollama:
+            url = f"{base_url}/api/generate"
+            payload = {
+                "model": model_name,
+                "prompt": prompt,
+                "system": system,
+                "stream": False,
+                "options": {"temperature": temperature, "num_predict": max_tokens},
+            }
+        else:
+            url = f"{base_url}/chat/completions"
+            payload = {
+                "model": model_name,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    raise RuntimeError(f"LLM HTTP {resp.status}: {text[:200]}")
+                data = await resp.json()
+
+        if is_ollama:
+            content = data.get("response", "")
+            if "error" in data:
+                logger.error(f"[Router] Ollama error: {data['error']}")
+                return ""
+        else:
+            content = data["choices"][0]["message"]["content"]
+
+        content = content.strip()
+        if not content:
+            logger.warning(f"[Router] LLM returned empty content for '{model_name}'.")
         if self.valves.DEBUG:
             logger.debug(f"[Router] LLM raw response: {content[:300]}")
         return content
 
-    # endregion
-
-    # region ── Expert classification (LLM + keyword fallback) ───────────────
+    # --- Original classification methods (unchanged) ---
     async def _classify_with_llm(self, user_query: str) -> Optional[str]:
-        """Use the small LLM to decide which expert should handle the query."""
         lines = []
         for exp in self._experts:
             line = f"- {exp['id']}: {exp['name']}"
@@ -389,43 +357,163 @@ class Filter:
             return None
 
     def _keyword_fallback(self, text: str) -> Optional[str]:
-        """Original keyword matching as last resort."""
         text_lower = text.lower()
         for exp in self._experts:
             if any(kw in text_lower for kw in exp.get("keywords", [])):
                 return exp["id"]
         return None
 
-    async def _classify_query(self, user_query: str) -> str:
-        """Classify the query using string cache -> LLM -> keyword fallback."""
-        # 1. Check cache (with TTL)
-        cache_key = user_query.lower()
+    # --- Contextual cache key ---
+    def _get_cache_key(
+        self, user_query: str, messages: list = None, context_window: int = 2
+    ) -> str:
+        base = user_query.lower().strip()
+        if messages and len(messages) > 1:
+            recent = [
+                m
+                for m in messages[-context_window - 1 : -1]
+                if isinstance(m, dict) and m.get("role") in ("user", "assistant")
+            ]
+            if recent:
+                context_str = "|".join(
+                    f"{m['role']}:{str(m.get('content', ''))[:80]}" for m in recent
+                )
+                ctx_hash = hashlib.md5(context_str.encode()).hexdigest()[:8]
+                return f"{base}::{ctx_hash}"
+        return base
+
+    # --- Semantic classification ---
+    def _build_expert_example_embeddings(self, experts_config: list) -> dict:
+        try:
+            if _SHARED_RESOURCES_AVAILABLE:
+                from shared_resources import get_embedder
+
+                embedder = get_embedder()
+            else:
+                from sentence_transformers import SentenceTransformer
+
+                embedder = SentenceTransformer("all-MiniLM-L6-v2")
+        except Exception:
+            return {}
+
+        import numpy as np
+
+        result = {}
+        for expert in experts_config:
+            expert_id = expert.get("id") or expert.get("name", "")
+            examples = expert.get("examples", [])
+            if not examples or not expert_id:
+                continue
+            try:
+                result[expert_id] = embedder.encode(
+                    examples, convert_to_numpy=True, batch_size=32
+                )
+            except Exception:
+                pass
+        return result
+
+    async def _semantic_classify(
+        self, user_query: str, experts_config: list, threshold: float = None
+    ) -> str:
+        import numpy as np
+
+        if threshold is None:
+            threshold = self.valves.SEMANTIC_THRESHOLD
+
+        if not experts_config:
+            return ""
+
+        current_hash = self._experts_json_hash
+        if (
+            not hasattr(self, "_expert_embeddings")
+            or not hasattr(self, "_expert_embeddings_hash")
+            or self._expert_embeddings_hash != current_hash
+        ):
+            import anyio
+
+            self._expert_embeddings = await anyio.to_thread.run_sync(
+                lambda: self._build_expert_example_embeddings(experts_config)
+            )
+            self._expert_embeddings_hash = current_hash
+
+        if not self._expert_embeddings:
+            return ""
+
+        try:
+            if _SHARED_RESOURCES_AVAILABLE:
+                from shared_resources import get_embedder
+
+                embedder = get_embedder()
+            else:
+                from sentence_transformers import SentenceTransformer
+
+                embedder = SentenceTransformer("all-MiniLM-L6-v2")
+        except Exception:
+            return ""
+
+        import anyio
+
+        query_vec = await anyio.to_thread.run_sync(
+            lambda: embedder.encode([user_query], convert_to_numpy=True)[0]
+        )
+        q_norm = query_vec / (np.linalg.norm(query_vec) + 1e-10)
+
+        best_id = ""
+        best_score = -1.0
+        for expert_id, example_vecs in self._expert_embeddings.items():
+            norms = np.linalg.norm(example_vecs, axis=1, keepdims=True) + 1e-10
+            scores = (example_vecs / norms) @ q_norm
+            score = float(scores.max())
+            if score > best_score:
+                best_score = score
+                best_id = expert_id
+
+        if best_score >= threshold:
+            if self.valves.DEBUG:
+                logger.info(
+                    f"[Router] Semantic classify: '{user_query[:50]}' → {best_id} (sim={best_score:.3f})"
+                )
+            return best_id
+        return ""
+
+    # --- Main classification pipeline ---
+    async def _classify_query(self, user_query: str, messages: list = None) -> str:
+        cache_key = self._get_cache_key(user_query, messages)
+
         cached = await self._string_cache.get(cache_key)
         if cached is not None:
             if self.valves.DEBUG:
-                logger.info(f"[Router] String cache hit: {cached}")
+                logger.info(f"[Router] Cache hit: '{user_query[:50]}' → {cached}")
             return cached
 
-        # 2. LLM classification
-        expert_id = await self._classify_with_llm(user_query)
-        if expert_id:
-            await self._string_cache.set(cache_key, expert_id)
-            return expert_id
+        expert_id = ""
 
-        # 3. Keyword fallback
-        expert_id = self._keyword_fallback(user_query)
-        if expert_id:
-            await self._string_cache.set(cache_key, expert_id)
-            return expert_id
+        # Semantic classification
+        if self.valves.USE_SEMANTIC_CLASSIFY:
+            try:
+                expert_id = await self._semantic_classify(user_query, self._experts)
+            except Exception as e:
+                if self.valves.DEBUG:
+                    logger.info(f"[Router] Semantic classify error: {e}")
+                expert_id = ""
 
-        # 4. Default
-        return self.valves.default_model
+        # LLM classifier
+        if not expert_id:
+            expert_id = await self._classify_with_llm(user_query) or ""
 
-    # endregion
+        # Keyword fallback
+        if not expert_id:
+            expert_id = self._keyword_fallback(user_query) or ""
 
-    # region ── Query rewriting (domain‑aware + rewrite cache) ───────────────
+        # Default
+        if not expert_id:
+            expert_id = self.valves.default_model
+
+        await self._string_cache.set(cache_key, expert_id)
+        return expert_id
+
+    # --- Query rewriting (unchanged) ---
     async def _rewrite_query(self, original: str, expert_id: str) -> str:
-        """Rewrite the user query into a precise search phrase, using cache if available."""
         cache_key = f"{original.lower()}|{expert_id}"
         cached = await self._rewrite_cache.get(cache_key)
         if cached is not None:
@@ -461,7 +549,6 @@ class Filter:
             logger.error(f"[Router] Query rewriting failed: {e}")
             rewritten = original
 
-        # Store in cache
         await self._rewrite_cache.set(cache_key, rewritten)
         if self.valves.DEBUG:
             logger.info(
@@ -469,14 +556,8 @@ class Filter:
             )
         return rewritten
 
-    # endregion
-
-    # region ── Native RAG injection ──────────────────────────────────────────
+    # --- RAG injection (unchanged) ---
     def _inject_rag_guidance(self, expert_id: str, messages: list) -> bool:
-        """
-        Insert RAG guidance by appending it to the first system message,
-        preserving the original system prompt (which includes tool definitions).
-        """
         collection = None
         kb_desc = None
         for exp in self._experts:
@@ -497,10 +578,8 @@ class Filter:
             "Use this knowledge base when relevant, but you may also use other available tools. "
             "Answer in the same language as the user."
         )
-        # Buscar el primer mensaje de sistema existente (que contiene la definición de herramientas)
         sys_msg = next((m for m in messages if m.get("role") == "system"), None)
         if sys_msg:
-            # Añadir la guía al final, sin borrar nada
             sys_msg["content"] = sys_msg["content"] + "\n\n" + guidance
         else:
             messages.insert(0, {"role": "system", "content": guidance})
@@ -511,29 +590,24 @@ class Filter:
             )
         return True
 
-    # endregion
+    # --- Helper to detect tool requests ---
+    def _is_tool_request(self, text: str) -> bool:
+        """Return True if the user message explicitly asks to use a tool."""
+        tool_keywords = [
+            "utiliza la herramienta", "usa la herramienta", "use the tool",
+            "search_and_crawl", "ejecuta la herramienta", "llama a la herramienta",
+            "run the tool", "call the tool", "utiliza la tool", "usa la tool",
+            "utiliza la función", "usa la función", "ejecuta la función",
+        ]
+        text_lower = text.lower()
+        return any(kw in text_lower for kw in tool_keywords)
 
-    # region ── Main routing logic ─────────────────────────────────────────────
-    async def _detect_expert(self, text: str) -> Tuple[str, str]:
-        """Determine the expert for a user message. Returns (model_id, display_name)."""
-        expert_id = await self._classify_query(text)
-        if expert_id == self.valves.default_model:
-            return self.valves.default_model, "General"
-        for exp in self._experts:
-            if exp["id"] == expert_id:
-                return expert_id, exp["name"]
-        return self.valves.default_model, "General"
-
+    # --- Inlet (now passes messages to classification) ---
     async def inlet(self, body: dict, **kwargs) -> dict:
-        """
-        Open WebUI filter inlet. Extracts user and __event_emitter__ from kwargs.
-        """
         user = kwargs.get("user", {})
         __event_emitter__ = kwargs.get("__event_emitter__")
 
-        # Sync cache configuration with current valves
         await self._sync_cache_config()
-        # Reload experts only if JSON changed (idempotent)
         self._load_experts()
 
         messages = body.get("messages", [])
@@ -544,9 +618,11 @@ class Filter:
         current_expert = metadata.get("router_expert")
         current_query = messages[-1].get("content", "")
 
-        new_expert, new_name = await self._detect_expert(current_query)
+        # Pass the full message history for contextual cache key
+        new_expert = await self._classify_query(current_query, messages)
+        new_name = self._get_expert_name(new_expert)
 
-        # Decide whether to switch (with context threshold)
+        # Decide whether to switch expert (with change threshold)
         if not current_expert:
             model_to_use = new_expert
             expert_name = new_name
@@ -572,14 +648,14 @@ class Filter:
                 expert_name = self._get_expert_name(current_expert)
                 change = False
 
-        # Optional query rewriting
+        # Optional query rewriting (skip if user is asking to use a tool)
         if self.valves.enable_query_rewriting and messages:
             original_query = messages[-1].get("content", "")
-            if original_query:
+            if original_query and not self._is_tool_request(original_query):
                 rewritten = await self._rewrite_query(original_query, model_to_use)
                 messages[-1]["content"] = rewritten
 
-        # Optional native RAG injection
+        # Optional RAG injection
         if (
             self.valves.enable_rag_injection
             and model_to_use != self.valves.default_model
@@ -594,14 +670,10 @@ class Filter:
 
         body["model"] = model_to_use
 
-        # Notification only on actual expert change (including first assignment)
         if __event_emitter__ and self.valves.notify_change and change:
             notif = self.valves.notification_template.format(expert=expert_name)
             await __event_emitter__(
-                {
-                    "type": "notification",
-                    "data": {"type": "info", "content": notif},
-                }
+                {"type": "notification", "data": {"type": "info", "content": notif}}
             )
         return body
 
@@ -610,5 +682,3 @@ class Filter:
             if exp["id"] == expert_id:
                 return exp["name"]
         return "General"
-
-    # endregion
